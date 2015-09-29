@@ -1,12 +1,27 @@
-require "bunny/cruby/socket"
-
 module Bunny
   module JRuby
     # TCP socket extension that uses Socket#readpartial to avoid excessive CPU
     # burn after some time. See issue #165.
     # @private
     module Socket
-      include Bunny::Socket
+      attr_accessor :options
+
+      READ_RETRY_EXCEPTION_CLASSES = [Errno::EAGAIN, Errno::EWOULDBLOCK, IO::WaitReadable]
+      WRITE_RETRY_EXCEPTION_CLASSES = [Errno::EAGAIN, Errno::EWOULDBLOCK, IO::WaitWritable]
+
+      def self.open(host, port, options = {})
+        socket = ::Socket.tcp(host, port, nil, nil,
+                              connect_timeout: options[:connect_timeout])
+        if ::Socket.constants.include?('TCP_NODELAY') || ::Socket.constants.include?(:TCP_NODELAY)
+          socket.setsockopt(::Socket::IPPROTO_TCP, ::Socket::TCP_NODELAY, true)
+        end
+        socket.setsockopt(::Socket::SOL_SOCKET, ::Socket::SO_KEEPALIVE, true) if options.fetch(:keepalive, true)
+        socket.extend self
+        socket.options = { :host => host, :port => port }.merge(options)
+        socket
+      rescue Errno::ETIMEDOUT
+        raise ClientTimeout
+      end
 
       # Reads given number of bytes with an optional timeout
       #
@@ -36,6 +51,40 @@ module Bunny
         end
         value
       end # read_fully
+
+      # Writes provided data using IO#write_nonblock, taking care of handling
+      # of exceptions it raises when writing would fail (e.g. due to socket buffer
+      # being full).
+      #
+      # IMPORTANT: this method will mutate (slice) the argument. Pass in duplicates
+      # if this is not appropriate in your case.
+      #
+      # @param [String] data Data to write
+      # @param [Integer] timeout Timeout
+      #
+      # @api public
+      def write_nonblock_fully(data, timeout = nil)
+        return nil if @__bunny_socket_eof_flag__
+
+        length = data.bytesize
+        total_count = 0
+        count = 0
+        loop do
+          begin
+            count = self.write_nonblock(data)
+          rescue *WRITE_RETRY_EXCEPTION_CLASSES
+            if IO.select([], [self], nil, timeout)
+              retry
+            else
+              raise Timeout::Error, "IO timeout when writing to socket"
+            end
+          end
+
+          total_count += count
+          return total_count if total_count >= length
+          data = data.byteslice(count..-1)
+        end
+      end
     end
   end
 end
